@@ -6,7 +6,8 @@
 
 
 
-
+double current_exposure_ = 50000.0;
+double current_gain_ = 0.0;
 
 
 
@@ -17,7 +18,9 @@ namespace hikrobot_camera
 CameraNode::CameraNode(const rclcpp::NodeOptions & options)
 : Node("hikrobot_camera", options)
 {
-  
+this->declare_parameter("exposure_time", 10000.0);
+this->declare_parameter("gain", 0.0);
+this->declare_parameter("frame_rate", 30.0);
 
 
 // 1. 初始化 SDK
@@ -55,7 +58,8 @@ param_callback_handle_ = this->add_on_set_parameters_callback(
 nRet = MV_CC_OpenDevice(handle_);
 if (MV_OK == nRet) {
     RCLCPP_INFO(this->get_logger(), "相机连接成功！");
-    
+    // 关闭触发模式，设置为连续采集
+    MV_CC_SetEnumValue(handle_, "TriggerMode", 0);
     
         // 1. 创建图像发布者
     image_pub_ = this->create_publisher<sensor_msgs::msg::Image>("image_raw", 10);
@@ -113,63 +117,113 @@ CameraNode::~CameraNode()
 
 void CameraNode::timer_callback()
 {
-    // 👇 新增：如果没连上，直接调用 reconnect 逻辑尝试重连
-    if (handle_ == nullptr) {
-        RCLCPP_WARN(this->get_logger(), "相机未连接，正在尝试重连...");
-        // 重新调用连接逻辑
-        MV_CC_DEVICE_INFO_LIST stDeviceList;
-        memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
-        int nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
-        if (MV_OK == nRet && stDeviceList.nDeviceNum > 0) {
-            if (MV_OK == MV_CC_CreateHandle(&handle_, stDeviceList.pDeviceInfo[0])) {
-                if (MV_OK == MV_CC_OpenDevice(handle_)) {
-                    MV_CC_StartGrabbing(handle_);
-                    // 重连后恢复参数
-                    MV_CC_SetFloatValue(handle_, "ExposureTime", current_exposure_);
-                    MV_CC_SetFloatValue(handle_, "Gain", current_gain_);
-                    RCLCPP_INFO(this->get_logger(), "相机重连成功！");
-                } else {
-                    handle_ = nullptr; // 重连失败，清空句柄
-                }
-            }
-        }
-        return; // 不管重连成没成功，本次回调先退出
+ // ================= 1. 断线重连逻辑 =================
+if (handle_ == nullptr) {
+    RCLCPP_WARN(this->get_logger(), "相机未连接，正在尝试重连...");
     
-// --- 下面保留你原本的图像抓取和发布代码 ---
-MV_FRAME_OUT stImageInfo = {0};
-memset(&stImageInfo, 0, sizeof(MV_FRAME_OUT));
+    MV_CC_DEVICE_INFO_LIST stDeviceList;
+    memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
+    int nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
+    
+    if (MV_OK == nRet && stDeviceList.nDeviceNum > 0) {
+        if (MV_OK == MV_CC_CreateHandle(&handle_, stDeviceList.pDeviceInfo[0])) {
+            if (MV_OK == MV_CC_OpenDevice(handle_)) {
+                MV_CC_StartGrabbing(handle_);
+                
+                // 1. 极其重要：重连后，相机可能会恢复自动曝光，必须先强制关闭自动模式！
+                MV_CC_SetEnumValue(handle_, "ExposureAuto", 0);
+                MV_CC_SetEnumValue(handle_, "GainAuto", 0);
 
-
-    if (MV_OK == nRet)
-    {
-        // 将海康的原始数据转为 OpenCV 图像 (假设是 BGR8 格式)
-        cv::Mat img(stImageInfo.stFrameInfo.nHeight, 
-                    stImageInfo.stFrameInfo.nWidth, 
-                    CV_8UC3, 
-                    stImageInfo.pBufAddr);
-
-        // 转换为 ROS 2 的 Image 消息并发布
-        std_msgs::msg::Header header;
-        header.stamp = this->now();
-        auto msg = cv_bridge::CvImage(header, "bgr8", img).toImageMsg();
-        image_pub_->publish(*msg);
-
-        // 释放缓冲区
-        MV_CC_FreeImageBuffer(handle_, &stImageInfo);
+                // 2. 恢复参数，并且打印结果，看看有没有设置成功！
+                int retExp = MV_CC_SetFloatValue(handle_, "ExposureTime", current_exposure_);
+                int retGain = MV_CC_SetFloatValue(handle_, "Gain", current_gain_);
+                
+                if (retExp != MV_OK || retGain != MV_OK) {
+                    RCLCPP_ERROR(this->get_logger(), "恢复参数失败! Exp:0x%x, Gain:0x%x", retExp, retGain);
+                } else {
+                    RCLCPP_INFO(this->get_logger(), "恢复参数成功: 曝光=%.1f, 增益=%.1f", current_exposure_, current_gain_);
+                }
+                RCLCPP_INFO(this->get_logger(), "相机重连成功!");
+            } else {
+                handle_ = nullptr;
+            }
+        } else {
+            handle_ = nullptr;
+        }
+    } else {
+        handle_ = nullptr;
     }
+    
+    // 【关键修复】：重连逻辑执行完毕后，必须直接 return 退出本次回调，绝不能往下走！
+    return; 
+} // <--- 这里必须闭合 if (handle_ == nullptr)！
 
-      // 你没截到的部分：在 if (MV_OK == nRet) 的 else 分支里
-else
-{
-    RCLCPP_WARN(this->get_logger(), "抓图失败，相机可能已断线！");
-    // 核心动作：直接把 handle_ 清空，让下次回调触发重连
-    handle_ = nullptr; 
+// ================= 2. 图像抓取与发布逻辑 =================
+// 注意：以下代码必须放在 if (handle_ == nullptr) 的外面！正常情况才会执行到这里！
+    // ================= 2. 图像抓取与发布逻辑 =================
+    // 注意：以下代码必须放在 if (handle_ == nullptr) 的外面！
+    MV_FRAME_OUT stImageInfo = {0};
+    memset(&stImageInfo, 0, sizeof(MV_FRAME_OUT));
+
+    // 真正去获取一帧图像
+    int nRet = MV_CC_GetImageBuffer(handle_, &stImageInfo, 1000);
+    //RCLCPP_INFO(this->get_logger(), "当前相机像素格式: 0x%lx", stImageInfo.stFrameInfo.enPixelType);
+    
+    if (nRet != MV_OK) {
+    RCLCPP_WARN(this->get_logger(), "获取图像失败, 错误码: 0x%x", nRet);
+    
+    // 【关键修复】：如果是掉线，必须主动断开旧连接，释放句柄，
+    // 否则下一次没法进入 if (handle_ == nullptr) 的重连逻辑。
+    // 加 try/catch 或者判断一下，保证即使已经掉线，调用清理函数也不会崩溃
+    if (handle_ != nullptr) {
+        MV_CC_StopGrabbing(handle_);
+        MV_CC_CloseDevice(handle_);
+        MV_CC_DestroyHandle(handle_);
+        handle_ = nullptr;
+        RCLCPP_WARN(this->get_logger(), "相机已掉线，已清理句柄，等待重连...");
+    }
+    return;
 }
 
-
-
+// 1. 安全校验：指针为空则跳过
+// 1. 安全校验：指针为空则跳过
+if (stImageInfo.pBufAddr == nullptr || stImageInfo.stFrameInfo.nFrameLen == 0) {
+    RCLCPP_WARN(this->get_logger(), "图像指针为空或数据无效，跳过本次发布");
+    MV_CC_FreeImageBuffer(handle_, &stImageInfo);
+    return;
 }
-}
+
+// 2. 获取真实的宽、高
+int width = stImageInfo.stFrameInfo.nWidth;
+int height = stImageInfo.stFrameInfo.nHeight;
+
+// 3. 使用 OpenCV 将海康的真实格式 YUV422 转换为标准的 BGR！
+// 根据之前的十六进制报错 (nFrameLen = 宽*高*2)，相机是每像素2字节的 YUV422
+cv::Mat yuv_img(height, width, CV_8UC2, stImageInfo.pBufAddr);
+cv::Mat bgr_img;
+cv::cvtColor(yuv_img, bgr_img, cv::COLOR_YUV2BGR_YUYV);
+
+// 4. 手动构建 ROS 2 消息 (完全避免 cv_bridge 导致的崩溃)
+auto msg = std::make_shared<sensor_msgs::msg::Image>();
+msg->header.stamp = this->now();
+msg->height = height;
+msg->width = width;
+msg->encoding = "bgr8"; 
+msg->is_bigendian = false;
+
+// 5. 严格按照 ROS 2 规范填充 step 和 data，保证数学上完美匹配！
+msg->step = width * 3; // BGR8 是每像素3字节
+size_t data_size = msg->step * height; // 这里的 data_size 绝对等于 msg->step * height
+msg->data.resize(data_size);
+
+// 6. 拷贝转换后的数据并发布
+memcpy(&msg->data[0], bgr_img.data, data_size);
+image_pub_->publish(*msg);
+
+// 7. 释放缓冲区
+MV_CC_FreeImageBuffer(handle_, &stImageInfo);
+} // <<<< 这是 timer_callback 函数的结束括号（你截图里第170行那个紫色括号）
+
 
 
 rcl_interfaces::msg::SetParametersResult CameraNode::parameters_callback(
@@ -201,6 +255,8 @@ rcl_interfaces::msg::SetParametersResult CameraNode::parameters_callback(
                     result.reason = "SDK设置曝光失败，错误码: " + std::to_string(nRet);
                     return result;
                 }
+
+                current_exposure_=exposure;
             }
             RCLCPP_INFO(this->get_logger(), "动态设置曝光: %f", exposure);
         }
@@ -213,7 +269,7 @@ rcl_interfaces::msg::SetParametersResult CameraNode::parameters_callback(
                 result.reason = "增益超出有效范围 (0 - 100 dB)";
                 return result;
             }
-
+            current_gain_=gain;
             if (handle_ != nullptr) {
                 MV_CC_SetEnumValue(handle_, "GainAuto", 0); // 关闭自动增益
                 int nRet = MV_CC_SetFloatValue(handle_, "Gain", gain);
